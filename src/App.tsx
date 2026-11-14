@@ -1462,11 +1462,21 @@ export default function App() {
   const [newTeacherPass, setNewTeacherPass] = useState("");
 
   const [attendanceModalClass, setAttendanceModalClass] = useState(null);
+  const [attendanceEventMeta, setAttendanceEventMeta] = useState(null);
   const [sessionTopic, setSessionTopic] = useState("");
   const [sessionRecords, setSessionRecords] = useState({});
   const [sessionDocId, setSessionDocId] = useState("");
   const [sessionCustomDocTitle, setSessionCustomDocTitle] = useState("");
   const [sessionCustomDocUrl, setSessionCustomDocUrl] = useState("");
+
+  // Điểm danh trực tiếp ngay lúc tạo lịch học (Mục 02)
+  const [calFormIncludeAttendance, setCalFormIncludeAttendance] = useState(false);
+  const [calFormAttendanceRecords, setCalFormAttendanceRecords] = useState({});
+
+  // Modal Sửa thông tin Lớp học & Sửa thông tin Học sinh sau khi tạo + Sửa Tài liệu
+  const [editingClassModal, setEditingClassModal] = useState(null);
+  const [editingStudentModal, setEditingStudentModal] = useState(null);
+  const [editingDocModal, setEditingDocModal] = useState(null);
 
   // ============================================================================
   // HÀM QUẢN LÝ NĂM HỌC (THÊM NĂM HỌC MỚI / ĐẶT NĂM HỌC MẶC ĐỊNH)
@@ -1774,10 +1784,103 @@ export default function App() {
       createdByRole: currentUser?.role || "teacher",
     };
 
+    let nextStudents = [...(appData.students || [])];
+    let nextAttendanceSessions = [...(appData.attendanceSessions || [])];
+
+    if (
+      !isStudent &&
+      calFormIncludeAttendance &&
+      Object.keys(calFormAttendanceRecords).length > 0
+    ) {
+      const dateStr = new Date().toLocaleString("vi-VN");
+      const sessionTopicStr = `${newEv.title} (${timeRangeText}${
+        dayObj ? ` • ${dayObj.fullDate}` : ""
+      })`;
+      const attachedDocLabel = newEv.lessonDocTitle || "";
+
+      nextStudents = nextStudents.map((st) => {
+        const belongs =
+          newEv.targetScope === "ALL" ||
+          isSameClass(st.classId, newEv.targetScope);
+        if (!belongs) return st;
+        const rec = calFormAttendanceRecords[st.id] || {
+          status: "PRESENT",
+          attitude: "Chú ý nghe giảng, ghi chép bài đầy đủ",
+        };
+        const prevHistory = st.attendanceHistory || [];
+        const scoreVal =
+          rec.status === "PRESENT"
+            ? 100
+            : rec.status === "LATE"
+            ? 85
+            : rec.status === "EXCUSED"
+            ? 70
+            : 0;
+        const statusLabel =
+          rec.status === "PRESENT"
+            ? "Đi học đầy đủ, đúng giờ"
+            : rec.status === "LATE"
+            ? "Đi học muộn"
+            : rec.status === "EXCUSED"
+            ? "Vắng có phép"
+            : "Vắng không phép";
+
+        const nextHistory = [
+          {
+            date: dateStr,
+            topic: sessionTopicStr,
+            attachedDocTitle: attachedDocLabel,
+            status: statusLabel,
+            scoreVal,
+            attitude: rec.attitude,
+            calendarEventId: newEv.id,
+          },
+          ...prevHistory,
+        ];
+
+        const avgRate = Math.round(
+          nextHistory.reduce((acc, cur) => acc + Number(cur.scoreVal), 0) /
+            nextHistory.length
+        );
+
+        return {
+          ...st,
+          attendanceRate: avgRate,
+          attendanceNote: `${statusLabel} (${
+            dayObj ? dayObj.fullDate : new Date().toLocaleDateString("vi-VN")
+          })`,
+          attitude: rec.attitude,
+          attendanceHistory: nextHistory,
+        };
+      });
+
+      const presentCount = Object.values(calFormAttendanceRecords).filter(
+        (r) => r.status === "PRESENT" || r.status === "LATE"
+      ).length;
+
+      const newSessionLog = {
+        id: "ATT" + Date.now(),
+        classId: newEv.targetScope,
+        calendarEventId: newEv.id,
+        dateKey: dayObj ? dayObj.dateKey : toDateKey(realTimeNow),
+        academicYear: activeYear,
+        date: dateStr,
+        topic: sessionTopicStr,
+        attachedDocTitle: attachedDocLabel,
+        attachedDocUrl: newEv.lessonDocUrl || "",
+        totalStudents: Object.keys(calFormAttendanceRecords).length,
+        presentCount,
+        records: calFormAttendanceRecords,
+      };
+      nextAttendanceSessions = [newSessionLog, ...nextAttendanceSessions];
+    }
+
     saveToAll({
       ...appData,
       timeSlots: nextSlots,
       calendarEvents: [...appData.calendarEvents, newEv],
+      students: nextStudents,
+      attendanceSessions: nextAttendanceSessions,
     });
     setCalForm({
       ...calForm,
@@ -1792,7 +1895,14 @@ export default function App() {
       lessonDocFileName: "",
       lessonDocDataUrl: "",
     });
-    notify("Đã lưu ca học và tài liệu đính kèm vào Bảng lịch!", "success");
+    setCalFormIncludeAttendance(false);
+    setCalFormAttendanceRecords({});
+    notify(
+      calFormIncludeAttendance
+        ? "Đã lưu ca học mới và hoàn tất điểm danh học sinh cho buổi học!"
+        : "Đã lưu ca học và tài liệu đính kèm vào Bảng lịch!",
+      "success"
+    );
   };
 
   // Lưu chỉnh sửa Giờ học / Ngày học / Tuần học & Tài liệu đính kèm của 1 thẻ trên Bảng Lịch
@@ -2898,30 +3008,104 @@ Email: ${TEACHER_INFO.email}`;
     });
   };
 
-  const openQuickAttendance = (cls) => {
-    const classStudents = getStudentsOfClass(cls.id);
+  const openQuickAttendance = (cls, eventMeta = null) => {
+    const classStudents =
+      cls.id === "ALL"
+        ? appData.students || []
+        : getStudentsOfClass(cls.id);
     if (classStudents.length === 0) {
       notify(
-        `Lớp ${cls.id} hiện chưa có học sinh nào. Vui lòng thêm học sinh vào lớp trước khi điểm danh.`,
+        cls.id === "ALL"
+          ? "Hệ thống hiện chưa có học sinh nào. Vui lòng thêm học sinh vào lớp trước khi điểm danh."
+          : `Lớp ${cls.id} hiện chưa có học sinh nào. Vui lòng thêm học sinh vào lớp trước khi điểm danh.`,
         "warn"
       );
       return;
     }
+
+    // Kiểm tra nếu ca học này đã từng điểm danh trong cùng ngày thì nạp lại trạng thái đã điểm danh để sửa/cập nhật
+    const existingSession = eventMeta?.eventId
+      ? (appData.attendanceSessions || []).find(
+          (s) =>
+            s.calendarEventId === eventMeta.eventId &&
+            (!eventMeta.dateKey || s.dateKey === eventMeta.dateKey)
+        )
+      : null;
+
     const initRec = {};
     classStudents.forEach((st) => {
-      initRec[st.id] = {
-        status: "PRESENT",
-        attitude: "Chú ý nghe giảng, ghi chép bài đầy đủ",
-      };
+      if (existingSession?.records && existingSession.records[st.id]) {
+        initRec[st.id] = existingSession.records[st.id];
+      } else {
+        initRec[st.id] = {
+          status: "PRESENT",
+          attitude: "Chú ý nghe giảng, ghi chép bài đầy đủ",
+        };
+      }
     });
     setSessionRecords(initRec);
     setSessionTopic(
-      `Buổi học ngày ${new Date().toLocaleDateString("vi-VN")}`
+      eventMeta?.topic ||
+        existingSession?.topic ||
+        `Buổi học ngày ${new Date().toLocaleDateString("vi-VN")}`
     );
-    setSessionDocId(cls.todayDocIds?.[0] || "");
-    setSessionCustomDocTitle(cls.todayCustomDocTitle || "");
-    setSessionCustomDocUrl(cls.todayCustomDocUrl || "");
+    setSessionDocId(
+      eventMeta?.attachedDocId !== undefined
+        ? eventMeta.attachedDocId
+        : cls.todayDocIds?.[0] || ""
+    );
+    setSessionCustomDocTitle(
+      eventMeta?.lessonDocTitle !== undefined
+        ? eventMeta.lessonDocTitle
+        : cls.todayCustomDocTitle || ""
+    );
+    setSessionCustomDocUrl(
+      eventMeta?.lessonDocUrl !== undefined
+        ? eventMeta.lessonDocUrl
+        : cls.todayCustomDocUrl || ""
+    );
+    setAttendanceEventMeta(eventMeta);
     setAttendanceModalClass(cls);
+  };
+
+  // Mở bảng điểm danh trực tiếp từ Thẻ Lịch Học (Mục 02) khi lớp đang diễn ra hoặc trên lịch
+  const openAttendanceFromCalendarEvent = (ev, dayObj = null) => {
+    const scope = ev.targetScope || "ALL";
+    if (scope.startsWith("HS:")) {
+      notify("Đây là lịch tự học cá nhân của học sinh.", "info");
+      return;
+    }
+    const foundCls =
+      scope === "ALL"
+        ? {
+            id: "ALL",
+            name: "Tất cả các lớp",
+            academicYear: ev.academicYear || appData.currentAcademicYear,
+            todayDocIds: [],
+          }
+        : (appData.classes || []).find((c) => isSameClass(c.id, scope)) || {
+            id: scope,
+            name: `Lớp ${scope}`,
+            academicYear: ev.academicYear || appData.currentAcademicYear,
+            todayDocIds: [],
+          };
+
+    const dateLabel = dayObj
+      ? `${dayObj.dayOfWeek} (${dayObj.fullDate})`
+      : ev.dayOfWeek || new Date().toLocaleDateString("vi-VN");
+    const timeLabel = ev.customTime || `${ev.startTime || ""} - ${ev.endTime || ""}`;
+
+    openQuickAttendance(foundCls, {
+      eventId: ev.id,
+      dateKey: dayObj ? dayObj.dateKey : toDateKey(realTimeNow),
+      fullDate: dayObj ? dayObj.fullDate : new Date().toLocaleDateString("vi-VN"),
+      dayOfWeek: dayObj ? dayObj.dayOfWeek : ev.dayOfWeek,
+      timeLabel,
+      topic: `${ev.title} (${timeLabel} • ${dateLabel})`,
+      attachedDocId: ev.attachedDocId || "",
+      lessonDocTitle: ev.lessonDocTitle || "",
+      lessonDocUrl: ev.lessonDocUrl || "",
+    });
   };
 
   const handleSaveAttendanceSession = (e) => {
@@ -2929,6 +3113,8 @@ Email: ${TEACHER_INFO.email}`;
     if (!attendanceModalClass) return;
 
     const dateStr = new Date().toLocaleString("vi-VN");
+    const shortDateStr =
+      attendanceEventMeta?.fullDate || new Date().toLocaleDateString("vi-VN");
     const linkedDoc = (appData.documents || []).find(
       (d) => d.id === sessionDocId
     );
@@ -2936,7 +3122,10 @@ Email: ${TEACHER_INFO.email}`;
       sessionCustomDocTitle.trim() || (linkedDoc ? linkedDoc.title : "");
 
     const nextStudents = appData.students.map((st) => {
-      if (st.classId !== attendanceModalClass.id) return st;
+      const belongs =
+        attendanceModalClass.id === "ALL" ||
+        isSameClass(st.classId, attendanceModalClass.id);
+      if (!belongs) return st;
       const rec = sessionRecords[st.id];
       if (!rec) return st;
 
@@ -2958,16 +3147,30 @@ Email: ${TEACHER_INFO.email}`;
           ? "Vắng có phép"
           : "Vắng không phép";
 
+      // Nếu sửa lại điểm danh của cùng ca học trong cùng ngày thì cập nhật bản ghi đó thay vì nhân đôi
+      const filteredPrevHistory =
+        attendanceEventMeta?.eventId
+          ? prevHistory.filter(
+              (h) =>
+                !(
+                  h.calendarEventId === attendanceEventMeta.eventId &&
+                  h.dateKey === attendanceEventMeta.dateKey
+                )
+            )
+          : prevHistory;
+
       const nextHistory = [
         {
           date: dateStr,
+          dateKey: attendanceEventMeta?.dateKey || toDateKey(realTimeNow),
+          calendarEventId: attendanceEventMeta?.eventId || "",
           topic: sessionTopic,
           attachedDocTitle: attachedDocLabel,
           status: statusLabel,
           scoreVal,
           attitude: rec.attitude,
         },
-        ...prevHistory,
+        ...filteredPrevHistory,
       ];
 
       const avgRate = Math.round(
@@ -2978,9 +3181,7 @@ Email: ${TEACHER_INFO.email}`;
       return {
         ...st,
         attendanceRate: avgRate,
-        attendanceNote: `${statusLabel} (${new Date().toLocaleDateString(
-          "vi-VN"
-        )})`,
+        attendanceNote: `${statusLabel} (${shortDateStr})`,
         attitude: rec.attitude,
         attendanceHistory: nextHistory,
       };
@@ -2988,7 +3189,7 @@ Email: ${TEACHER_INFO.email}`;
 
     // Cập nhật luôn tài liệu học hôm đó vào lớp học
     const nextClasses = appData.classes.map((c) =>
-      c.id === attendanceModalClass.id
+      isSameClass(c.id, attendanceModalClass.id)
         ? {
             ...c,
             todayDocIds: sessionDocId ? [sessionDocId] : c.todayDocIds || [],
@@ -3000,9 +3201,15 @@ Email: ${TEACHER_INFO.email}`;
         : c
     );
 
+    const presentCount = Object.values(sessionRecords).filter(
+      (r) => r.status === "PRESENT" || r.status === "LATE"
+    ).length;
+
     const newSessionLog = {
       id: "ATT" + Date.now(),
       classId: attendanceModalClass.id,
+      calendarEventId: attendanceEventMeta?.eventId || "",
+      dateKey: attendanceEventMeta?.dateKey || toDateKey(realTimeNow),
       academicYear:
         attendanceModalClass.academicYear ||
         appData.currentAcademicYear ||
@@ -3013,21 +3220,358 @@ Email: ${TEACHER_INFO.email}`;
       attachedDocUrl:
         sessionCustomDocUrl.trim() || (linkedDoc ? linkedDoc.externalUrl : ""),
       totalStudents: Object.keys(sessionRecords).length,
+      presentCount,
+      records: sessionRecords,
     };
+
+    const prevSessions = (appData.attendanceSessions || []).filter((s) =>
+      attendanceEventMeta?.eventId
+        ? !(
+            s.calendarEventId === attendanceEventMeta.eventId &&
+            s.dateKey === attendanceEventMeta.dateKey
+          )
+        : true
+    );
 
     saveToAll({
       ...appData,
       classes: nextClasses,
       students: nextStudents,
-      attendanceSessions: [
-        newSessionLog,
-        ...(appData.attendanceSessions || []),
-      ],
+      attendanceSessions: [newSessionLog, ...prevSessions],
     });
     setAttendanceModalClass(null);
+    setAttendanceEventMeta(null);
     notify(
-      `Đã lưu điểm danh & đính kèm tài liệu buổi học Lớp ${attendanceModalClass.id}!`,
+      `✅ Đã lưu điểm danh (${presentCount}/${Object.keys(sessionRecords).length} HS có mặt) cho ${
+        attendanceModalClass.id === "ALL"
+          ? "Toàn bộ các lớp"
+          : `Lớp ${attendanceModalClass.id}`
+      }!`,
       "success"
+    );
+  };
+
+  // Lưu chỉnh sửa thông tin Lớp học sau khi tạo (Đồng bộ tự động sang HS, Lịch, Tài liệu, Bài tập)
+  const handleSaveEditedClass = (e) => {
+    e.preventDefault();
+    if (!editingClassModal) return;
+    const origId = editingClassModal.originalId;
+    const newId = (editingClassModal.id || "").trim().toUpperCase();
+    const newName = (editingClassModal.name || "").trim();
+    const newGrade = editingClassModal.grade || "12";
+    const newYear =
+      editingClassModal.academicYear ||
+      appData.currentAcademicYear ||
+      "2026 - 2027";
+    const newSchedule =
+      (editingClassModal.scheduleSummary || "").trim() || "Theo Thời khóa biểu";
+
+    if (!newId || !newName) {
+      notify("Vui lòng nhập đầy đủ Mã lớp và Tên lớp!", "warn");
+      return;
+    }
+
+    if (
+      !isSameClass(origId, newId) &&
+      (appData.classes || []).some((c) => isSameClass(c.id, newId))
+    ) {
+      notify(`Mã lớp ${newId} đã tồn tại! Vui lòng chọn mã lớp khác.`, "warn");
+      return;
+    }
+
+    const nextClasses = (appData.classes || []).map((c) =>
+      isSameClass(c.id, origId)
+        ? {
+            ...c,
+            id: newId,
+            name: newName,
+            grade: newGrade,
+            academicYear: newYear,
+            scheduleSummary: newSchedule,
+          }
+        : c
+    );
+
+    const nextStudents = (appData.students || []).map((s) =>
+      isSameClass(s.classId, origId)
+        ? {
+            ...s,
+            classId: newId,
+            grade: newGrade,
+            academicYear: newYear,
+          }
+        : s
+    );
+
+    const nextCalEvents = (appData.calendarEvents || []).map((ev) =>
+      isSameClass(ev.targetScope, origId)
+        ? {
+            ...ev,
+            targetScope: newId,
+            ownerName: `Lớp ${newId}`,
+          }
+        : ev
+    );
+
+    const nextDocs = (appData.documents || []).map((d) =>
+      isSameClass(d.classId, origId)
+        ? { ...d, classId: newId, grade: newGrade }
+        : d
+    );
+
+    const nextHomeworks = (appData.homeworks || []).map((h) =>
+      isSameClass(h.classId, origId)
+        ? {
+            ...h,
+            classId: newId,
+            targetLabel:
+              h.sendMode === "BULK" ? `Lớp ${newId}` : h.targetLabel,
+          }
+        : h
+    );
+
+    const nextHwSubs = (appData.homeworkSubmissions || []).map((sub) =>
+      isSameClass(sub.classId, origId) ? { ...sub, classId: newId } : sub
+    );
+
+    const nextExams = (appData.examPapers || []).map((ex) =>
+      isSameClass(ex.classId, origId) ? { ...ex, classId: newId } : ex
+    );
+
+    const nextAch = (appData.achievements || []).map((a) =>
+      isSameClass(a.classId, origId) ? { ...a, classId: newId } : a
+    );
+
+    const nextAtt = (appData.attendanceSessions || []).map((att) =>
+      isSameClass(att.classId, origId) ? { ...att, classId: newId } : att
+    );
+
+    const nextAnn = (appData.announcements || []).map((ann) =>
+      isSameClass(ann.classId, origId) ? { ...ann, classId: newId } : ann
+    );
+
+    const nextPosts = (appData.chemFeedPosts || []).map((p) =>
+      isSameClass(p.classId, origId) ? { ...p, classId: newId } : p
+    );
+
+    saveToAll({
+      ...appData,
+      classes: nextClasses,
+      students: nextStudents,
+      calendarEvents: nextCalEvents,
+      documents: nextDocs,
+      homeworks: nextHomeworks,
+      homeworkSubmissions: nextHwSubs,
+      examPapers: nextExams,
+      achievements: nextAch,
+      attendanceSessions: nextAtt,
+      announcements: nextAnn,
+      chemFeedPosts: nextPosts,
+    });
+
+    if (isSameClass(selectedClassFilter, origId)) {
+      setSelectedClassFilter(newId);
+    }
+    if (isSameClass(rosterFilterClass, origId)) {
+      setRosterFilterClass(newId);
+    }
+    if (isSameClass(calendarFilterClass, origId)) {
+      setCalendarFilterClass(newId);
+    }
+
+    setEditingClassModal(null);
+    notify(`✅ Đã cập nhật thông tin Lớp ${newId} (${newName}) thành công!`, "success");
+  };
+
+  // Lưu chỉnh sửa thông tin Học sinh sau khi tạo
+  const handleSaveEditedStudent = (e) => {
+    e.preventDefault();
+    if (!editingStudentModal) return;
+
+    const origId = editingStudentModal.originalId;
+    const newId = (editingStudentModal.id || "").trim();
+    const newName = (editingStudentModal.name || "").trim();
+    const newClassId = (editingStudentModal.classId || "")
+      .trim()
+      .toUpperCase();
+
+    if (!newId || !newName || !newClassId) {
+      notify("Vui lòng nhập đầy đủ Mã HS, Họ tên và Lớp học!", "warn");
+      return;
+    }
+
+    if (
+      newId.toLowerCase() !== origId.toLowerCase() &&
+      (appData.students || []).some(
+        (s) => s.id.toLowerCase() === newId.toLowerCase()
+      )
+    ) {
+      notify(`Mã học sinh "${newId}" đã tồn tại! Vui lòng nhập mã khác.`, "warn");
+      return;
+    }
+
+    let nextClasses = [...(appData.classes || [])];
+    let targetCls = nextClasses.find((c) => isSameClass(c.id, newClassId));
+    const resolvedYear =
+      editingStudentModal.academicYear ||
+      targetCls?.academicYear ||
+      appData.currentAcademicYear ||
+      "2026 - 2027";
+
+    if (!targetCls) {
+      let detectedGrade = editingStudentModal.grade || "12";
+      if (newClassId.startsWith("10")) detectedGrade = "10";
+      else if (newClassId.startsWith("11")) detectedGrade = "11";
+      else if (newClassId.startsWith("12")) detectedGrade = "12";
+      targetCls = {
+        id: newClassId,
+        isUserCreated: true,
+        name: `Lớp Hóa ${newClassId}`,
+        grade: detectedGrade,
+        academicYear: resolvedYear,
+        scheduleSummary: "Theo Thời khóa biểu",
+        todayDocIds: [],
+      };
+      nextClasses.push(targetCls);
+    }
+
+    const resolvedGrade =
+      editingStudentModal.grade || targetCls.grade || "12";
+    const parsedScore =
+      editingStudentModal.score !== "" && editingStudentModal.score !== undefined
+        ? Number(editingStudentModal.score)
+        : 0;
+    const parsedAttRate =
+      editingStudentModal.attendanceRate !== "" &&
+      editingStudentModal.attendanceRate !== undefined
+        ? Math.min(100, Math.max(0, Number(editingStudentModal.attendanceRate)))
+        : 100;
+
+    const nextStudents = (appData.students || []).map((s) =>
+      s.id === origId
+        ? {
+            ...s,
+            id: newId,
+            name: newName,
+            classId: targetCls.id,
+            grade: resolvedGrade,
+            academicYear: resolvedYear,
+            email:
+              (editingStudentModal.email || "").trim() ||
+              `${newName.toLowerCase().replace(/\s+/g, "")}@gmail.com`,
+            password: (editingStudentModal.password || "").trim() || "123456",
+            targetScore: (editingStudentModal.targetScore || "").trim() || "8.5+",
+            universityGoal: (editingStudentModal.universityGoal || "").trim(),
+            score: isNaN(parsedScore) ? s.score : parsedScore,
+            attendanceRate: isNaN(parsedAttRate)
+              ? s.attendanceRate
+              : parsedAttRate,
+            attendanceNote:
+              (editingStudentModal.attendanceNote || "").trim() ||
+              "Đi học đầy đủ",
+            attitude:
+              (editingStudentModal.attitude || "").trim() ||
+              "Tập trung chú ý bài giảng",
+            teacherComment:
+              (editingStudentModal.teacherComment || "").trim() ||
+              s.teacherComment,
+          }
+        : s
+    );
+
+    const nextHwSubs = (appData.homeworkSubmissions || []).map((sub) =>
+      sub.studentId === origId
+        ? {
+            ...sub,
+            studentId: newId,
+            studentName: newName,
+            classId: targetCls.id,
+          }
+        : sub
+    );
+
+    const nextHomeworks = (appData.homeworks || []).map((hw) => ({
+      ...hw,
+      targetStudentId:
+        hw.targetStudentId === origId ? newId : hw.targetStudentId,
+      completedBy: (hw.completedBy || []).map((cid) =>
+        cid === origId ? newId : cid
+      ),
+    }));
+
+    const nextCalEvents = (appData.calendarEvents || []).map((ev) =>
+      ev.targetScope === `HS:${origId}`
+        ? {
+            ...ev,
+            targetScope: `HS:${newId}`,
+            ownerName: `Lịch cá nhân: ${newName}`,
+          }
+        : ev
+    );
+
+    saveToAll({
+      ...appData,
+      classes: nextClasses,
+      students: nextStudents,
+      homeworkSubmissions: nextHwSubs,
+      homeworks: nextHomeworks,
+      calendarEvents: nextCalEvents,
+    });
+
+    if (selectedStudentId === origId) {
+      setSelectedStudentId(newId);
+    }
+    setEditingStudentModal(null);
+    notify(
+      `✅ Đã cập nhật thông tin Học sinh ${newName} (Lớp ${targetCls.id})!`,
+      "success"
+    );
+  };
+
+  // Lưu chỉnh sửa hoặc xóa Tài liệu đã tải lên
+  const handleSaveEditedDocument = (e) => {
+    e.preventDefault();
+    if (!editingDocModal || !editingDocModal.title.trim()) return;
+    const chapList = appData.curriculum?.[editingDocModal.grade] || [];
+    const foundChap = chapList.find((c) => c.id === editingDocModal.chapterId);
+
+    const nextDocs = (appData.documents || []).map((d) =>
+      d.id === editingDocModal.id
+        ? {
+            ...d,
+            title: editingDocModal.title.trim(),
+            grade: editingDocModal.grade,
+            classId: editingDocModal.classId,
+            chapterId: editingDocModal.chapterId,
+            chapterTitle: foundChap
+              ? foundChap.title
+              : editingDocModal.chapterTitle || "Tài liệu chuyên đề",
+            externalUrl: (editingDocModal.externalUrl || "").trim(),
+            note: (editingDocModal.note || "").trim(),
+            fileName: editingDocModal.fileName || d.fileName,
+            fileType: editingDocModal.fileType || d.fileType,
+            fileDataUrl: editingDocModal.fileDataUrl || d.fileDataUrl,
+          }
+        : d
+    );
+    saveToAll({
+      ...appData,
+      documents: nextDocs,
+    });
+    setEditingDocModal(null);
+    notify("Đã cập nhật thông tin tài liệu học tập!", "success");
+  };
+
+  const handleDeleteDocument = (doc) => {
+    askConfirm(
+      `Bạn có chắc chắn muốn xóa tài liệu "${doc.title}" khỏi Kho tài liệu không?`,
+      () => {
+        saveToAll({
+          ...appData,
+          documents: (appData.documents || []).filter((d) => d.id !== doc.id),
+        });
+        notify(`Đã xóa tài liệu "${doc.title}".`, "info");
+      }
     );
   };
 
@@ -3407,14 +3951,23 @@ Email: ${TEACHER_INFO.email}`;
     },
     {
       id: "documents",
-      code: "05",
-      title: "Kho Tài liệu Lớp/Chương & Giao Bài tập",
-      desc: "Tải tài liệu theo từng lớp & từng chương (tự động báo tin tức Học thuật); giao & nộp bài tập qua Mail.",
-      badge: `${(appData.documents || []).length} TL • ${
-        (appData.homeworks || []).length
-      } BTVN`,
+      code: "05A",
+      title: "Kho Tài liệu Lớp/Chương (Tải Tài liệu Riêng)",
+      desc: "Ô riêng chuyên tải tài liệu học tập theo từng lớp & từng chương (tự động báo tin tức Học thuật Mục 01 & đồng bộ Mục 03).",
+      badge: `${(appData.documents || []).length} tài liệu`,
       bg: "bg-white text-[#1B3B48] border border-[#E2DFD7]",
       accent: "text-[#5C7667]",
+    },
+    {
+      id: "homeworks",
+      code: "05B",
+      title: "Giao Bài Tập, Nộp Bài & Chấm Điểm Riêng",
+      desc: "Ô riêng chuyên giao bài tập qua Email (cài giờ tự khóa link nộp), cổng học sinh nộp bài và chấm điểm đồng bộ Hồ sơ Mục 04.",
+      badge: `${(appData.homeworks || []).length} BTVN • ${
+        (appData.homeworkSubmissions || []).length
+      } bài nộp`,
+      bg: "bg-[#2C4A3E] text-[#F7F6F2] border border-[#5C7667]",
+      accent: "text-[#E9C46A]",
     },
     {
       id: "exams",
@@ -3448,8 +4001,8 @@ Email: ${TEACHER_INFO.email}`;
           {
             id: "students_admin",
             code: "09",
-            title: "Quản lý Lớp, Năm học, Điểm danh & Excel",
-            desc: "Quản lý năm học, tạo/xóa lớp, đính kèm tài liệu buổi học, điểm danh nhanh và nhập Excel hàng loạt.",
+            title: "Quản lý & Sửa Lớp, Học sinh, Điểm danh & Excel",
+            desc: "Tạo/sửa/xóa lớp học, chỉnh sửa thông tin học sinh sau khi tạo, điểm danh nhanh và nhập Excel hàng loạt.",
             badge: `${yearFilteredClasses.length} lớp • ${yearFilteredStudents.length} HS`,
             bg: "bg-[#3D405B] text-[#F7F6F2]",
             accent: "text-[#F2CC8F]",
@@ -3780,7 +4333,7 @@ Email: ${TEACHER_INFO.email}`;
           badge: catMeta.badge,
           title: a.title,
           sub: `${a.targetLabel || a.classId} • ${a.date}`,
-          targetView: a.linkedHomeworkId ? "documents" : "announcements",
+          targetView: a.linkedHomeworkId ? "homeworks" : "announcements",
           category: a.category || "CLASS_NOTICE",
         };
       }),
@@ -3794,7 +4347,7 @@ Email: ${TEACHER_INFO.email}`;
               ? `Đã chấm: ${sub.gradeScore}/10`
               : "Chưa chấm điểm"
           }`,
-          targetView: "documents",
+          targetView: "homeworks",
           category: "SUBMISSION",
         }))
       : []),
@@ -4065,7 +4618,7 @@ Email: ${TEACHER_INFO.email}`;
                       type="button"
                       onClick={() => {
                         setShowBellDropdown(false);
-                        navigateTo("documents");
+                        navigateTo("homeworks");
                       }}
                       className="font-bold text-[#2C4A3E] hover:underline"
                     >
@@ -4335,14 +4888,35 @@ Email: ${TEACHER_INFO.email}`;
                         </div>
 
                         {currentUser.role === "teacher" && (
-                          <div className="flex items-center justify-between pt-2 border-t border-[#E2DFD7] text-[11px] font-bold">
+                          <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#E2DFD7] text-[11px] font-bold">
                             <button
+                              type="button"
                               onClick={() => openQuickAttendance(cls)}
                               className="text-[#2C4A3E] hover:underline"
                             >
-                              ✓ Điểm danh & TL hôm nay
+                              ✓ Điểm danh & TL
                             </button>
                             <button
+                              type="button"
+                              onClick={() =>
+                                setEditingClassModal({
+                                  originalId: cls.id,
+                                  id: cls.id,
+                                  name: cls.name || "",
+                                  grade: cls.grade || "12",
+                                  academicYear:
+                                    cls.academicYear ||
+                                    appData.currentAcademicYear ||
+                                    "2026 - 2027",
+                                  scheduleSummary: cls.scheduleSummary || "",
+                                })
+                              }
+                              className="text-[#9C6644] hover:underline"
+                            >
+                              ✎ Sửa lớp
+                            </button>
+                            <button
+                              type="button"
                               onClick={() => {
                                 setSelectedClassFilter(cls.id);
                                 navigateTo("progress");
@@ -4352,6 +4926,7 @@ Email: ${TEACHER_INFO.email}`;
                               Xem HS
                             </button>
                             <button
+                              type="button"
                               onClick={() => handleDeleteClass(cls)}
                               className="text-red-600 hover:underline"
                             >
@@ -5350,15 +5925,358 @@ Email: ${TEACHER_INFO.email}`;
                 </div>
               </div>
 
-              <div className="flex justify-end">
+              {/* KHU VỰC ĐIỂM DANH HỌC SINH NGAY LÚC TẠO LỊCH (KHI LỚP ĐANG DIỄN RA) */}
+              {currentUser.role === "teacher" && (
+                <div className="p-4 rounded-xl bg-emerald-50/80 border-2 border-[#2C4A3E] space-y-3">
+                  {(() => {
+                    const selectedDayObj = activeWeekInfo.days.find(
+                      (d) => d.dayOfWeek === calForm.dayOfWeek
+                    );
+                    const formLiveStatus = selectedDayObj
+                      ? getLiveSessionStatus(
+                          selectedDayObj.dateKey,
+                          calForm.startTime,
+                          calForm.endTime,
+                          realTimeNow
+                        )
+                      : null;
+                    const targetClassStudents =
+                      calForm.targetScope === "ALL"
+                        ? appData.students || []
+                        : getStudentsOfClass(calForm.targetScope);
+
+                    const initFormAttendanceIfNeeded = (checked) => {
+                      setCalFormIncludeAttendance(checked);
+                      if (checked) {
+                        const nextRec = { ...calFormAttendanceRecords };
+                        targetClassStudents.forEach((st) => {
+                          if (!nextRec[st.id]) {
+                            nextRec[st.id] = {
+                              status: "PRESENT",
+                              attitude: "Chú ý nghe giảng, ghi chép bài đầy đủ",
+                            };
+                          }
+                        });
+                        setCalFormAttendanceRecords(nextRec);
+                      }
+                    };
+
+                    return (
+                      <>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <label className="flex items-center gap-2 cursor-pointer text-xs font-extrabold text-[#1B3B48]">
+                              <input
+                                type="checkbox"
+                                checked={calFormIncludeAttendance}
+                                onChange={(e) =>
+                                  initFormAttendanceIfNeeded(e.target.checked)
+                                }
+                                className="w-4 h-4 accent-[#2C4A3E]"
+                              />
+                              <span>
+                                ✅ Điểm danh Học sinh ngay lúc tạo lịch ca học này (
+                                {calForm.targetScope === "ALL"
+                                  ? `Tất cả các lớp • ${targetClassStudents.length} HS`
+                                  : `Lớp ${calForm.targetScope} • ${targetClassStudents.length} HS`}
+                                )
+                              </span>
+                            </label>
+                            {formLiveStatus?.code === "LIVE" && (
+                              <span className="px-2.5 py-0.5 rounded-full bg-emerald-500 text-white text-[10px] font-black animate-pulse">
+                                🟢 Khung giờ ca học này đang diễn ra ngay lúc này!
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                initFormAttendanceIfNeeded(
+                                  !calFormIncludeAttendance
+                                )
+                              }
+                              className="px-3 py-1.5 rounded-lg bg-[#2C4A3E] text-[#E9C46A] text-xs font-bold hover:bg-[#1B3B48] transition"
+                            >
+                              {calFormIncludeAttendance
+                                ? "▲ Thu gọn bảng điểm danh"
+                                : "📋 Mở bảng điểm danh HS ngay tại đây"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const foundCls =
+                                  calForm.targetScope === "ALL"
+                                    ? {
+                                        id: "ALL",
+                                        name: "Tất cả các lớp",
+                                        academicYear: selectedAcademicYear,
+                                        todayDocIds: [],
+                                      }
+                                    : (appData.classes || []).find((c) =>
+                                        isSameClass(c.id, calForm.targetScope)
+                                      ) || {
+                                        id: calForm.targetScope,
+                                        name: `Lớp ${calForm.targetScope}`,
+                                        academicYear: selectedAcademicYear,
+                                        todayDocIds: [],
+                                      };
+                                openQuickAttendance(foundCls, {
+                                  dateKey: selectedDayObj
+                                    ? selectedDayObj.dateKey
+                                    : toDateKey(realTimeNow),
+                                  fullDate: selectedDayObj
+                                    ? selectedDayObj.fullDate
+                                    : new Date().toLocaleDateString("vi-VN"),
+                                  topic: `${
+                                    calForm.title || "Buổi học"
+                                  } (${calForm.startTime} - ${calForm.endTime})`,
+                                  attachedDocId: calForm.attachedDocId,
+                                  lessonDocTitle: calForm.lessonDocTitle,
+                                  lessonDocUrl: calForm.lessonDocUrl,
+                                });
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-white border border-[#2C4A3E] text-[#1B3B48] text-xs font-bold hover:bg-gray-50 transition"
+                            >
+                              ✓ Điểm danh cửa sổ lớn
+                            </button>
+                          </div>
+                        </div>
+
+                        {calFormIncludeAttendance && (
+                          <div className="space-y-2 pt-2 border-t border-[#2C4A3E]/20">
+                            {targetClassStudents.length === 0 ? (
+                              <div className="p-3 rounded-xl bg-white text-xs text-[#5C7667] italic">
+                                Lớp {calForm.targetScope} hiện chưa có học sinh nào. Hãy thêm học sinh ở Mục 09 trước khi điểm danh.
+                              </div>
+                            ) : (
+                              <>
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-bold text-[#2C4A3E]">
+                                  <span>
+                                    Đánh dấu trạng thái có mặt và thái độ học tập của {targetClassStudents.length} học sinh trong ca học đang diễn ra:
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const allPresent = {};
+                                      targetClassStudents.forEach((st) => {
+                                        allPresent[st.id] = {
+                                          status: "PRESENT",
+                                          attitude:
+                                            "Chú ý nghe giảng, ghi chép bài đầy đủ",
+                                        };
+                                      });
+                                      setCalFormAttendanceRecords(allPresent);
+                                    }}
+                                    className="px-2.5 py-1 rounded bg-white border border-[#2C4A3E] text-[#1B3B48] text-[10px] font-bold"
+                                  >
+                                    ✓ Đặt tất cả Có mặt đúng giờ
+                                  </button>
+                                </div>
+                                <div className="max-h-60 overflow-y-auto space-y-1.5 pr-1">
+                                  {targetClassStudents.map((st, idx) => {
+                                    const cur = calFormAttendanceRecords[
+                                      st.id
+                                    ] || {
+                                      status: "PRESENT",
+                                      attitude:
+                                        "Chú ý nghe giảng, ghi chép bài đầy đủ",
+                                    };
+                                    return (
+                                      <div
+                                        key={st.id}
+                                        className="p-2.5 rounded-xl bg-white border border-[#E2DFD7] grid grid-cols-1 sm:grid-cols-12 gap-2 items-center text-xs"
+                                      >
+                                        <div className="sm:col-span-4 font-bold text-[#1B3B48]">
+                                          {idx + 1}. {st.name}{" "}
+                                          <span className="text-[10px] text-[#5C7667] font-normal">
+                                            (Lớp {st.classId})
+                                          </span>
+                                        </div>
+                                        <div className="sm:col-span-3">
+                                          <select
+                                            value={cur.status}
+                                            onChange={(e) =>
+                                              setCalFormAttendanceRecords({
+                                                ...calFormAttendanceRecords,
+                                                [st.id]: {
+                                                  ...cur,
+                                                  status: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            className="w-full p-1.5 rounded-lg border bg-[#F7F6F2] font-bold text-xs"
+                                          >
+                                            <option value="PRESENT">
+                                              ✅ Có mặt đầy đủ
+                                            </option>
+                                            <option value="LATE">
+                                              🕒 Đi học muộn
+                                            </option>
+                                            <option value="EXCUSED">
+                                              📩 Vắng có phép
+                                            </option>
+                                            <option value="ABSENT">
+                                              ❌ Vắng không phép
+                                            </option>
+                                          </select>
+                                        </div>
+                                        <div className="sm:col-span-5">
+                                          <input
+                                            type="text"
+                                            value={cur.attitude}
+                                            onChange={(e) =>
+                                              setCalFormAttendanceRecords({
+                                                ...calFormAttendanceRecords,
+                                                [st.id]: {
+                                                  ...cur,
+                                                  attitude: e.target.value,
+                                                },
+                                              })
+                                            }
+                                            placeholder="Nhận xét thái độ buổi học..."
+                                            className="w-full p-1.5 rounded-lg border text-xs"
+                                          />
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+
+              <div className="flex flex-wrap justify-end gap-2">
+                {currentUser.role === "teacher" && !calFormIncludeAttendance && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const targetClassStudents =
+                        calForm.targetScope === "ALL"
+                          ? appData.students || []
+                          : getStudentsOfClass(calForm.targetScope);
+                      const nextRec = {};
+                      targetClassStudents.forEach((st) => {
+                        nextRec[st.id] = {
+                          status: "PRESENT",
+                          attitude: "Chú ý nghe giảng, ghi chép bài đầy đủ",
+                        };
+                      });
+                      setCalFormAttendanceRecords(nextRec);
+                      setCalFormIncludeAttendance(true);
+                    }}
+                    className="bg-[#2C4A3E] hover:bg-[#1B3B48] text-[#E9C46A] py-2.5 px-4 rounded-xl text-xs font-bold transition"
+                  >
+                    📋 Điểm danh HS ngay trong lúc tạo lịch
+                  </button>
+                )}
                 <button
                   type="submit"
-                  className="bg-[#1B3B48] hover:bg-[#2C4A3E] text-white py-2.5 px-5 rounded-xl text-xs font-bold transition"
+                  className="bg-[#1B3B48] hover:bg-[#2C4A3E] text-white py-2.5 px-5 rounded-xl text-xs font-bold transition shadow-sm"
                 >
-                  + Lưu Ca Học & Tài Liệu Đính Kèm Vào Bảng Lịch
+                  {calFormIncludeAttendance
+                    ? "✅ Lưu Ca Học & Hoàn Tất Điểm Danh Học Sinh"
+                    : "+ Lưu Ca Học & Tài Liệu Đính Kèm Vào Bảng Lịch"}
                 </button>
               </div>
             </form>
+
+            {/* BANNER CÁC LỚP ĐANG DIỄN RA NGAY LÚC NÀY ĐỂ ĐIỂM DANH 1 CHẠM */}
+            {currentUser.role === "teacher" &&
+              (() => {
+                const todayObj = activeWeekInfo.days.find((d) => d.isToday);
+                if (!todayObj) return null;
+                const liveEventsNow = (appData.calendarEvents || []).filter(
+                  (ev) => {
+                    if (!matchesSelectedYear(ev.academicYear)) return false;
+                    if (ev.dayOfWeek !== todayObj.dayOfWeek) return false;
+                    if (ev.targetScope?.startsWith("HS:")) return false;
+                    const isRecurring =
+                      !ev.repeatMode || ev.repeatMode === "RECURRING";
+                    if (isRecurring) {
+                      if (
+                        (ev.excludedWeeks || []).includes(
+                          activeWeekInfo.weekKey
+                        )
+                      )
+                        return false;
+                    } else if (ev.weekKey !== activeWeekInfo.weekKey) {
+                      return false;
+                    }
+                    const st = getLiveSessionStatus(
+                      todayObj.dateKey,
+                      ev.startTime,
+                      ev.endTime,
+                      realTimeNow
+                    );
+                    return st?.code === "LIVE";
+                  }
+                );
+
+                if (liveEventsNow.length === 0) return null;
+
+                return (
+                  <div className="p-4 rounded-2xl bg-[#1B3B48] text-white border-2 border-emerald-400 shadow-md space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="px-2.5 py-1 rounded-full bg-emerald-400 text-[#1B3B48] text-xs font-black animate-pulse">
+                          🟢 LỚP HỌC ĐANG DIỄN RA NGAY LÚC NÀY ({liveEventsNow.length})
+                        </span>
+                        <span className="text-xs text-[#E9C46A] font-semibold">
+                          Giáo viên có thể bấm điểm danh trực tiếp cho học sinh đang học trong ca:
+                        </span>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {liveEventsNow.map((ev) => {
+                        const attLog = (appData.attendanceSessions || []).find(
+                          (s) =>
+                            s.calendarEventId === ev.id &&
+                            s.dateKey === todayObj.dateKey
+                        );
+                        return (
+                          <div
+                            key={ev.id}
+                            className="p-3 rounded-xl bg-white/10 border border-emerald-400/50 flex flex-wrap items-center justify-between gap-3"
+                          >
+                            <div className="space-y-0.5">
+                              <div className="text-xs font-extrabold text-[#E9C46A]">
+                                {ev.ownerName} • 🕒 {ev.customTime}
+                              </div>
+                              <div className="text-sm font-bold text-white">
+                                {ev.title}
+                              </div>
+                              {attLog && (
+                                <div className="text-[11px] text-emerald-300 font-bold">
+                                  ✓ Đã điểm danh: {attLog.presentCount ?? attLog.totalStudents}/{attLog.totalStudents} HS có mặt
+                                </div>
+                              )}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                openAttendanceFromCalendarEvent(ev, todayObj)
+                              }
+                              className="px-3.5 py-2 rounded-xl bg-emerald-400 hover:bg-emerald-300 text-[#1B3B48] text-xs font-black transition shadow"
+                            >
+                              {attLog
+                                ? "✎ Cập nhật Điểm danh ca đang học"
+                                : "✅ Điểm danh HS đang học ngay"}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
 
             {/* Bộ lọc lớp trên Bảng Lịch */}
             <div className="flex flex-wrap items-center justify-between gap-2 bg-white p-4 rounded-2xl border border-[#E2DFD7]">
@@ -5650,6 +6568,55 @@ Email: ${TEACHER_INFO.email}`;
                                         </div>
                                       </div>
                                     )}
+
+                                    {/* NÚT ĐIỂM DANH HỌC SINH NGAY TRÊN THẺ LỊCH HỌC (KHI LỚP ĐANG DIỄN RA HOẶC TRÊN LỊCH) */}
+                                    {currentUser.role === "teacher" &&
+                                      !isPersonal &&
+                                      (() => {
+                                        const sessionAtt = (
+                                          appData.attendanceSessions || []
+                                        ).find(
+                                          (s) =>
+                                            s.calendarEventId === ev.id &&
+                                            s.dateKey === dayObj.dateKey
+                                        );
+                                        const isLiveNow =
+                                          liveStatus?.code === "LIVE";
+                                        return (
+                                          <div className="pt-1.5 mt-1 border-t border-white/15 space-y-1">
+                                            {sessionAtt && (
+                                              <div className="text-[10px] font-extrabold text-emerald-300">
+                                                ✓ Đã điểm danh:{" "}
+                                                {sessionAtt.presentCount ??
+                                                  sessionAtt.totalStudents}
+                                                /{sessionAtt.totalStudents} HS
+                                              </div>
+                                            )}
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                openAttendanceFromCalendarEvent(
+                                                  ev,
+                                                  dayObj
+                                                )
+                                              }
+                                              className={`w-full py-1 px-2 rounded-lg text-[10px] font-extrabold transition flex items-center justify-center gap-1 ${
+                                                isLiveNow
+                                                  ? "bg-emerald-400 hover:bg-emerald-300 text-[#1B3B48] shadow animate-pulse"
+                                                  : sessionAtt
+                                                  ? "bg-white/20 hover:bg-white/30 text-[#E9C46A]"
+                                                  : "bg-[#2C4A3E] hover:bg-[#5C7667] text-[#E9C46A] border border-[#E9C46A]/40"
+                                              }`}
+                                            >
+                                              {isLiveNow
+                                                ? "🟢 Điểm danh HS (Đang diễn ra)"
+                                                : sessionAtt
+                                                ? "✎ Sửa Điểm danh ca này"
+                                                : "✓ Điểm danh HS ca này"}
+                                            </button>
+                                          </div>
+                                        );
+                                      })()}
                                   </div>
                                 );
                               })}
@@ -5913,20 +6880,39 @@ Email: ${TEACHER_INFO.email}`;
                     />
                   </div>
 
-                  <div className="flex justify-end gap-2 pt-2">
-                    <button
-                      type="button"
-                      onClick={() => setEditingCalEvent(null)}
-                      className="px-4 py-2 rounded-xl bg-gray-100 text-xs font-bold"
-                    >
-                      Hủy
-                    </button>
-                    <button
-                      type="submit"
-                      className="px-5 py-2 rounded-xl bg-[#1B3B48] text-white text-xs font-bold"
-                    >
-                      Lưu Thay Đổi Lịch & Tài Liệu
-                    </button>
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t">
+                    {currentUser.role === "teacher" &&
+                      !editingCalEvent.targetScope?.startsWith("HS:") && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const targetDay = activeWeekInfo.days.find(
+                              (d) => d.dayOfWeek === editingCalEvent.dayOfWeek
+                            );
+                            const evCopy = { ...editingCalEvent };
+                            setEditingCalEvent(null);
+                            openAttendanceFromCalendarEvent(evCopy, targetDay);
+                          }}
+                          className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold"
+                        >
+                          ✅ Điểm danh Học sinh ca học này
+                        </button>
+                      )}
+                    <div className="flex items-center gap-2 ml-auto">
+                      <button
+                        type="button"
+                        onClick={() => setEditingCalEvent(null)}
+                        className="px-4 py-2 rounded-xl bg-gray-100 text-xs font-bold"
+                      >
+                        Hủy
+                      </button>
+                      <button
+                        type="submit"
+                        className="px-5 py-2 rounded-xl bg-[#1B3B48] text-white text-xs font-bold"
+                      >
+                        Lưu Thay Đổi Lịch & Tài Liệu
+                      </button>
+                    </div>
                   </div>
                 </form>
               </div>
@@ -6511,7 +7497,40 @@ Email: ${TEACHER_INFO.email}`;
                   Tiến độ Cá nhân, Kết quả Bài Kiểm tra trên lớp & Nhận xét
                 </h2>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {currentUser.role === "teacher" && activeStudent && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setEditingStudentModal({
+                        originalId: activeStudent.id,
+                        id: activeStudent.id,
+                        name: activeStudent.name || "",
+                        classId: activeStudent.classId || "",
+                        grade: activeStudent.grade || "12",
+                        academicYear:
+                          activeStudent.academicYear ||
+                          appData.currentAcademicYear ||
+                          "2026 - 2027",
+                        email: activeStudent.email || "",
+                        password: activeStudent.password || "123456",
+                        targetScore: activeStudent.targetScore || "8.5+",
+                        universityGoal: activeStudent.universityGoal || "",
+                        score: activeStudent.score ?? 0,
+                        attendanceRate: activeStudent.attendanceRate ?? 100,
+                        attendanceNote:
+                          activeStudent.attendanceNote || "Đi học đầy đủ",
+                        attitude:
+                          activeStudent.attitude ||
+                          "Tập trung chú ý bài giảng",
+                        teacherComment: activeStudent.teacherComment || "",
+                      })
+                    }
+                    className="px-3.5 py-2 rounded-xl bg-[#9C6644] hover:bg-[#7F5135] text-white text-xs font-bold transition"
+                  >
+                    ✎ Sửa thông tin HS ({activeStudent.name})
+                  </button>
+                )}
                 <button
                   onClick={() => window.print()}
                   className="px-3.5 py-2 rounded-xl bg-[#5C7667] text-white text-xs font-bold"
@@ -6859,28 +7878,37 @@ Email: ${TEACHER_INFO.email}`;
         )}
 
         {/* ===================================================================
-            MỤC 05: KHO TÀI LIỆU THEO LỚP/CHƯƠNG & GIAO BÀI TẬP QUA MAIL
+            MỤC 05A: Ô TẢI TÀI LIỆU & KHO TÀI LIỆU THEO LỚP/CHƯƠNG (TÁCH RIÊNG)
         =================================================================== */}
         {activeView === "documents" && (
           <div className="space-y-6">
             <div className="bg-white p-6 rounded-2xl border border-[#E2DFD7] flex flex-wrap items-center justify-between gap-4">
               <div>
                 <span className="text-xs font-bold uppercase text-[#5C7667]">
-                  Mục 05 • Kho Tài liệu Lớp/Chương & Giao Bài tập qua Email
+                  Mục 05A • Ô Tải Tài liệu & Kho Tài liệu Lớp/Chương (Đã tách riêng với Ô Giao Bài Tập)
                 </span>
                 <h2 className="text-2xl font-bold text-[#1B3B48]">
-                  Kho Tài liệu Học tập Theo Lớp/Chương, Giao Bài tập & Nơi Nộp Bài
+                  📚 Kho Tài Liệu Học Tập Theo Từng Lớp & Từng Chương
                 </h2>
                 <p className="text-xs text-[#5C7667] mt-1">
                   Khi Giáo viên tải tài liệu mới lên Kho Tài liệu, mục Tin tức <strong>📘 Học thuật</strong> sẽ tự động cập nhật để Phụ huynh và Học sinh theo dõi.
                 </p>
               </div>
-              <button
-                onClick={goBack}
-                className="px-4 py-2 rounded-xl bg-[#EFECE6] text-[#1B3B48] text-xs font-bold hover:bg-[#E2DFD7]"
-              >
-                ← Quay lại trang trước
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => navigateTo("homeworks")}
+                  className="px-4 py-2 rounded-xl bg-[#2C4A3E] text-[#E9C46A] text-xs font-bold hover:bg-[#1B3B48] transition shadow-sm"
+                >
+                  📝 Sang Ô Giao Bài Tập & Chấm Điểm (Mục 05B) →
+                </button>
+                <button
+                  onClick={goBack}
+                  className="px-4 py-2 rounded-xl bg-[#EFECE6] text-[#1B3B48] text-xs font-bold hover:bg-[#E2DFD7]"
+                >
+                  ← Quay lại trang trước
+                </button>
+              </div>
             </div>
 
             {/* KHU VỰC 1: TẢI LÊN & TRA CỨU TÀI LIỆU THEO TỪNG LỚP, TỪNG CHƯƠNG */}
@@ -7116,13 +8144,69 @@ Email: ${TEACHER_INFO.email}`;
                             ⬇ Tải File
                           </a>
                         )}
+                        {currentUser.role === "teacher" && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => setEditingDocModal({ ...doc })}
+                              className="bg-[#EFECE6] hover:bg-[#E2DFD7] text-[#1B3B48] px-2.5 py-1.5 rounded-lg text-xs font-bold"
+                              title="Sửa thông tin tài liệu"
+                            >
+                              ✎ Sửa
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteDocument(doc)}
+                              className="bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 px-2.5 py-1.5 rounded-lg text-xs font-bold"
+                              title="Xóa tài liệu"
+                            >
+                              ✕
+                            </button>
+                          </>
+                        )}
                       </div>
                     </div>
                   ))}
               </div>
             </div>
+          </div>
+        )}
 
-            {/* KHU VỰC 2: GIAO BÀI TẬP QUA MAIL & NỘP BÀI TẬP */}
+        {/* ===================================================================
+            MỤC 05B: Ô GIAO BÀI TẬP QUA MAIL, NƠI NỘP BÀI & CHẤM ĐIỂM (TÁCH RIÊNG)
+        =================================================================== */}
+        {activeView === "homeworks" && (
+          <div className="space-y-6">
+            <div className="bg-white p-6 rounded-2xl border border-[#E2DFD7] flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <span className="text-xs font-bold uppercase text-[#5C7667]">
+                  Mục 05B • Ô Giao Bài Tập, Cổng Nộp Bài & Chấm Điểm Đồng Bộ Hồ Sơ (Đã tách riêng với Ô Tải Tài Liệu)
+                </span>
+                <h2 className="text-2xl font-bold text-[#1B3B48]">
+                  📝 Giao Bài Tập Qua Email, Nơi Học Sinh Nộp Bài & Bảng Chấm Điểm
+                </h2>
+                <p className="text-xs text-[#5C7667] mt-1">
+                  Giao bài tập hàng loạt theo lớp hoặc từng cá nhân kèm thời hạn tự động khóa nộp bài; chấm điểm tự động đồng bộ vào Hồ sơ Mục 04.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => navigateTo("documents")}
+                  className="px-4 py-2 rounded-xl bg-[#1B3B48] text-[#E9C46A] text-xs font-bold hover:bg-[#2C4A3E] transition shadow-sm"
+                >
+                  📚 Sang Ô Tải Tài Liệu Học Tập (Mục 05A) →
+                </button>
+                <button
+                  onClick={goBack}
+                  className="px-4 py-2 rounded-xl bg-[#EFECE6] text-[#1B3B48] text-xs font-bold hover:bg-[#E2DFD7]"
+                >
+                  ← Quay lại trang trước
+                </button>
+              </div>
+            </div>
+
+            {/* KHU VỰC GIAO BÀI TẬP QUA MAIL & NỘP BÀI TẬP */}
             {currentUser.role === "teacher" && (
               <form
                 onSubmit={handleAssignHomeworkAndEmail}
@@ -10176,14 +11260,35 @@ Email: ${TEACHER_INFO.email}`;
                         </div>
                       </div>
 
-                      <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-[#E2DFD7]">
+                      <div className="flex flex-wrap items-center justify-between gap-1.5 pt-3 border-t border-[#E2DFD7]">
                         <button
+                          type="button"
                           onClick={() => openQuickAttendance(cls)}
-                          className="bg-[#5C7667] hover:bg-[#4A6154] text-white px-3 py-1.5 rounded-lg text-xs font-bold"
+                          className="bg-[#5C7667] hover:bg-[#4A6154] text-white px-2.5 py-1.5 rounded-lg text-xs font-bold"
                         >
-                          ✓ Điểm danh & TL buổi học
+                          ✓ Điểm danh & TL
                         </button>
                         <button
+                          type="button"
+                          onClick={() =>
+                            setEditingClassModal({
+                              originalId: cls.id,
+                              id: cls.id,
+                              name: cls.name || "",
+                              grade: cls.grade || "12",
+                              academicYear:
+                                cls.academicYear ||
+                                appData.currentAcademicYear ||
+                                "2026 - 2027",
+                              scheduleSummary: cls.scheduleSummary || "",
+                            })
+                          }
+                          className="bg-[#1B3B48] hover:bg-[#2C4A3E] text-[#E9C46A] px-2.5 py-1.5 rounded-lg text-xs font-bold"
+                        >
+                          ✎ Sửa lớp
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => handleDeleteClass(cls)}
                           className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2.5 py-1.5 rounded-lg text-xs font-bold"
                         >
@@ -10599,7 +11704,40 @@ Email: ${TEACHER_INFO.email}`;
                                 </div>
                               </td>
                               <td className="p-3 border text-center">
-                                <div className="flex items-center justify-center gap-1.5">
+                                <div className="flex flex-wrap items-center justify-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setEditingStudentModal({
+                                        originalId: st.id,
+                                        id: st.id,
+                                        name: st.name || "",
+                                        classId: st.classId || "",
+                                        grade: st.grade || "12",
+                                        academicYear:
+                                          st.academicYear ||
+                                          appData.currentAcademicYear ||
+                                          "2026 - 2027",
+                                        email: st.email || "",
+                                        password: st.password || "123456",
+                                        targetScore: st.targetScore || "8.5+",
+                                        universityGoal: st.universityGoal || "",
+                                        score: st.score ?? 0,
+                                        attendanceRate:
+                                          st.attendanceRate ?? 100,
+                                        attendanceNote:
+                                          st.attendanceNote || "Đi học đầy đủ",
+                                        attitude:
+                                          st.attitude ||
+                                          "Tập trung chú ý bài giảng",
+                                        teacherComment:
+                                          st.teacherComment || "",
+                                      })
+                                    }
+                                    className="px-2.5 py-1 rounded-lg bg-[#9C6644] hover:bg-[#7F5135] text-white font-bold"
+                                  >
+                                    ✎ Sửa HS
+                                  </button>
                                   <button
                                     type="button"
                                     onClick={() => {
@@ -10915,7 +12053,11 @@ Email: ${TEACHER_INFO.email}`;
 
             <div className="flex-1 overflow-y-auto space-y-2 pr-1">
               {appData.students
-                .filter((s) => s.classId === attendanceModalClass.id)
+                .filter((s) =>
+                  attendanceModalClass.id === "ALL"
+                    ? true
+                    : isSameClass(s.classId, attendanceModalClass.id)
+                )
                 .map((st) => {
                   const cur = sessionRecords[st.id] || {
                     status: "PRESENT",
@@ -11117,6 +12259,652 @@ Email: ${TEACHER_INFO.email}`;
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* MODAL CHỈNH SỬA THÔNG TIN LỚP HỌC SAU KHI TẠO */}
+      {editingClassModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+          <form
+            onSubmit={handleSaveEditedClass}
+            className="bg-white rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-xl border border-[#E2DFD7]"
+          >
+            <div className="flex items-center justify-between border-b pb-3">
+              <div>
+                <span className="px-2.5 py-0.5 rounded bg-[#1B3B48] text-[#E9C46A] text-xs font-bold">
+                  Chỉnh sửa Lớp học
+                </span>
+                <h3 className="font-bold text-base text-[#1B3B48] mt-1">
+                  ✎ Sửa Thông Tin Lớp {editingClassModal.originalId}
+                </h3>
+                <p className="text-xs text-[#5C7667]">
+                  Mọi thay đổi về Mã lớp, Tên lớp, Khối và Năm học sẽ tự động đồng bộ sang danh sách Học sinh, Lịch học, Tài liệu và Bài tập của lớp.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingClassModal(null)}
+                className="text-xs font-bold text-[#5C7667]"
+              >
+                ✕ Đóng
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Mã lớp (VD: 12TA1_ĐH):
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editingClassModal.id}
+                  onChange={(e) =>
+                    setEditingClassModal({
+                      ...editingClassModal,
+                      id: e.target.value.toUpperCase(),
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border font-bold text-[#1B3B48]"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Khối lớp:
+                </label>
+                <select
+                  value={editingClassModal.grade}
+                  onChange={(e) =>
+                    setEditingClassModal({
+                      ...editingClassModal,
+                      grade: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border bg-white font-bold"
+                >
+                  <option value="10">Khối 10</option>
+                  <option value="11">Khối 11</option>
+                  <option value="12">Khối 12</option>
+                </select>
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Tên lớp hiển thị:
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editingClassModal.name}
+                  onChange={(e) =>
+                    setEditingClassModal({
+                      ...editingClassModal,
+                      name: e.target.value,
+                    })
+                  }
+                  placeholder="VD: Lớp Hóa 12 Luyện thi Đại học"
+                  className="w-full p-2.5 rounded-xl border"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Năm học:
+                </label>
+                <select
+                  value={editingClassModal.academicYear}
+                  onChange={(e) =>
+                    setEditingClassModal({
+                      ...editingClassModal,
+                      academicYear: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border bg-white font-bold"
+                >
+                  {(appData.academicYears || DEFAULT_ACADEMIC_YEARS).map(
+                    (y) => (
+                      <option key={y} value={y}>
+                        Năm học {y}
+                      </option>
+                    )
+                  )}
+                </select>
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Tóm tắt Ca học / Lịch học:
+                </label>
+                <input
+                  type="text"
+                  value={editingClassModal.scheduleSummary}
+                  onChange={(e) =>
+                    setEditingClassModal({
+                      ...editingClassModal,
+                      scheduleSummary: e.target.value,
+                    })
+                  }
+                  placeholder="VD: Thứ 2, 4, 6 (19:45 - 21:15)"
+                  className="w-full p-2.5 rounded-xl border"
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t">
+              <button
+                type="button"
+                onClick={() => setEditingClassModal(null)}
+                className="px-4 py-2 rounded-xl bg-gray-100 text-xs font-bold"
+              >
+                Hủy
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 rounded-xl bg-[#1B3B48] text-[#E9C46A] text-xs font-bold"
+              >
+                💾 Lưu Thay Đổi Lớp Học
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* MODAL CHỈNH SỬA THÔNG TIN HỌC SINH SAU KHI TẠO */}
+      {editingStudentModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+          <form
+            onSubmit={handleSaveEditedStudent}
+            className="bg-white rounded-2xl max-w-2xl w-full p-6 space-y-4 shadow-xl border border-[#E2DFD7] max-h-[90vh] overflow-y-auto"
+          >
+            <div className="flex items-center justify-between border-b pb-3">
+              <div>
+                <span className="px-2.5 py-0.5 rounded bg-[#9C6644] text-white text-xs font-bold">
+                  Chỉnh sửa Hồ sơ Học sinh
+                </span>
+                <h3 className="font-bold text-base text-[#1B3B48] mt-1">
+                  ✎ Sửa Thông Tin Học Sinh: {editingStudentModal.name} ({editingStudentModal.originalId})
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingStudentModal(null)}
+                className="text-xs font-bold text-[#5C7667]"
+              >
+                ✕ Đóng
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Mã Học sinh:
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editingStudentModal.id}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      id: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border font-mono font-bold"
+                />
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Họ và tên Học sinh:
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editingStudentModal.name}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      name: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border font-bold text-[#1B3B48]"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Lớp học:
+                </label>
+                {appData.classes.length > 0 ? (
+                  <select
+                    value={editingStudentModal.classId}
+                    onChange={(e) => {
+                      const pickedCls = appData.classes.find((c) =>
+                        isSameClass(c.id, e.target.value)
+                      );
+                      setEditingStudentModal({
+                        ...editingStudentModal,
+                        classId: e.target.value,
+                        grade: pickedCls?.grade || editingStudentModal.grade,
+                        academicYear:
+                          pickedCls?.academicYear ||
+                          editingStudentModal.academicYear,
+                      });
+                    }}
+                    className="w-full p-2.5 rounded-xl border bg-white font-bold"
+                  >
+                    {!appData.classes.some((c) =>
+                      isSameClass(c.id, editingStudentModal.classId)
+                    ) && (
+                      <option value={editingStudentModal.classId}>
+                        Lớp {editingStudentModal.classId}
+                      </option>
+                    )}
+                    {appData.classes.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        Lớp {c.id} ({c.name})
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    required
+                    value={editingStudentModal.classId}
+                    onChange={(e) =>
+                      setEditingStudentModal({
+                        ...editingStudentModal,
+                        classId: e.target.value.toUpperCase(),
+                      })
+                    }
+                    className="w-full p-2.5 rounded-xl border font-bold"
+                  />
+                )}
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Khối lớp:
+                </label>
+                <select
+                  value={editingStudentModal.grade}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      grade: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border bg-white font-bold"
+                >
+                  <option value="10">Khối 10</option>
+                  <option value="11">Khối 11</option>
+                  <option value="12">Khối 12</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Năm học:
+                </label>
+                <select
+                  value={editingStudentModal.academicYear}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      academicYear: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border bg-white font-bold"
+                >
+                  {(appData.academicYears || DEFAULT_ACADEMIC_YEARS).map(
+                    (y) => (
+                      <option key={y} value={y}>
+                        Năm học {y}
+                      </option>
+                    )
+                  )}
+                </select>
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Email đăng nhập (HS / Phụ huynh):
+                </label>
+                <input
+                  type="email"
+                  value={editingStudentModal.email}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      email: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Mật khẩu đăng nhập:
+                </label>
+                <input
+                  type="text"
+                  value={editingStudentModal.password}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      password: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border font-mono font-bold text-[#2C4A3E]"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Mục tiêu điểm số:
+                </label>
+                <input
+                  type="text"
+                  value={editingStudentModal.targetScore}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      targetScore: e.target.value,
+                    })
+                  }
+                  placeholder="VD: 8.5+, 9.0+"
+                  className="w-full p-2.5 rounded-xl border"
+                />
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Định hướng Đại học / Nguyện vọng:
+                </label>
+                <input
+                  type="text"
+                  value={editingStudentModal.universityGoal}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      universityGoal: e.target.value,
+                    })
+                  }
+                  placeholder="VD: ĐH Y Dược TP.HCM, ĐH Bách Khoa..."
+                  className="w-full p-2.5 rounded-xl border"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Điểm trung bình (/10):
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="10"
+                  value={editingStudentModal.score}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      score: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Tỷ lệ chuyên cần (%):
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={editingStudentModal.attendanceRate}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      attendanceRate: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Ghi chú chuyên cần:
+                </label>
+                <input
+                  type="text"
+                  value={editingStudentModal.attendanceNote}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      attendanceNote: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border"
+                />
+              </div>
+
+              <div className="sm:col-span-3">
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Thái độ học tập:
+                </label>
+                <input
+                  type="text"
+                  value={editingStudentModal.attitude}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      attitude: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border"
+                />
+              </div>
+
+              <div className="sm:col-span-3">
+                <label className="block font-bold text-[#1B3B48] mb-1">
+                  Nhận xét của Giáo viên:
+                </label>
+                <textarea
+                  rows={2}
+                  value={editingStudentModal.teacherComment}
+                  onChange={(e) =>
+                    setEditingStudentModal({
+                      ...editingStudentModal,
+                      teacherComment: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border"
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t">
+              <button
+                type="button"
+                onClick={() => setEditingStudentModal(null)}
+                className="px-4 py-2 rounded-xl bg-gray-100 text-xs font-bold"
+              >
+                Hủy
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 rounded-xl bg-[#1B3B48] text-[#E9C46A] text-xs font-bold"
+              >
+                💾 Lưu Thông Tin Học Sinh
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* MODAL CHỈNH SỬA TÀI LIỆU ĐÃ TẢI LÊN */}
+      {editingDocModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+          <form
+            onSubmit={handleSaveEditedDocument}
+            className="bg-white rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-xl border border-[#E2DFD7]"
+          >
+            <div className="flex items-center justify-between border-b pb-3">
+              <h3 className="font-bold text-base text-[#1B3B48]">
+                ✎ Sửa Thông Tin Tài Liệu Học Tập
+              </h3>
+              <button
+                type="button"
+                onClick={() => setEditingDocModal(null)}
+                className="text-xs font-bold text-[#5C7667]"
+              >
+                ✕ Đóng
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block font-bold mb-1">Tên tài liệu:</label>
+                <input
+                  type="text"
+                  required
+                  value={editingDocModal.title || ""}
+                  onChange={(e) =>
+                    setEditingDocModal({
+                      ...editingDocModal,
+                      title: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border font-bold"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-bold mb-1">Khối lớp:</label>
+                  <select
+                    value={editingDocModal.grade || "12"}
+                    onChange={(e) => {
+                      const g = e.target.value;
+                      const firstChap =
+                        (appData.curriculum?.[g] || [])[0]?.id || "";
+                      setEditingDocModal({
+                        ...editingDocModal,
+                        grade: g,
+                        chapterId: firstChap,
+                      });
+                    }}
+                    className="w-full p-2.5 rounded-xl border bg-white font-bold"
+                  >
+                    <option value="10">Khối 10</option>
+                    <option value="11">Khối 11</option>
+                    <option value="12">Khối 12</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block font-bold mb-1">Áp dụng cho Lớp:</label>
+                  <select
+                    value={editingDocModal.classId || "ALL"}
+                    onChange={(e) =>
+                      setEditingDocModal({
+                        ...editingDocModal,
+                        classId: e.target.value,
+                      })
+                    }
+                    className="w-full p-2.5 rounded-xl border bg-white font-bold"
+                  >
+                    <option value="ALL">Tất cả các lớp</option>
+                    {appData.classes.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        Lớp {c.id}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block font-bold mb-1">Thuộc Chương:</label>
+                <select
+                  value={editingDocModal.chapterId || ""}
+                  onChange={(e) =>
+                    setEditingDocModal({
+                      ...editingDocModal,
+                      chapterId: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border bg-white font-bold"
+                >
+                  {(appData.curriculum?.[editingDocModal.grade || "12"] || []).map(
+                    (ch) => (
+                      <option key={ch.id} value={ch.id}>
+                        {ch.title}
+                      </option>
+                    )
+                  )}
+                </select>
+              </div>
+
+              <div>
+                <label className="block font-bold mb-1">
+                  Link tải (Google Drive / OneDrive):
+                </label>
+                <input
+                  type="text"
+                  value={editingDocModal.externalUrl || ""}
+                  onChange={(e) =>
+                    setEditingDocModal({
+                      ...editingDocModal,
+                      externalUrl: e.target.value,
+                    })
+                  }
+                  className="w-full p-2.5 rounded-xl border"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold mb-1">
+                  Thay đổi tệp đính kèm (nếu cần):
+                </label>
+                <input
+                  type="file"
+                  onChange={(e) =>
+                    handleFlexibleFileUpload(e, (res) =>
+                      setEditingDocModal((prev) => ({
+                        ...prev,
+                        fileName: res.fileName,
+                        fileType: res.fileType,
+                        fileDataUrl: res.dataUrl,
+                      }))
+                    )
+                  }
+                  className="text-xs w-full"
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t">
+              <button
+                type="button"
+                onClick={() => setEditingDocModal(null)}
+                className="px-4 py-2 rounded-xl bg-gray-100 text-xs font-bold"
+              >
+                Hủy
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 rounded-xl bg-[#1B3B48] text-white text-xs font-bold"
+              >
+                Lưu Tài Liệu
+              </button>
+            </div>
+          </form>
         </div>
       )}
 
